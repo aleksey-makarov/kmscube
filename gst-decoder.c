@@ -45,6 +45,9 @@ GST_DEBUG_CATEGORY_EXTERN(kmscube_debug);
 
 #define MAX_NUM_PLANES 3
 
+static const uint32_t format = DRM_FORMAT_XRGB8888;
+static const uint32_t gst_format = GST_VIDEO_FORMAT_BGRx;
+
 inline static const char *
 yesno(int yes)
 {
@@ -57,7 +60,6 @@ struct decoder {
 	GstElement         *sink;
 	pthread_t           gst_thread;
 
-	uint32_t            format;
 	GstVideoInfo        info;
 
 	const struct gbm   *gbm;
@@ -92,17 +94,7 @@ pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
 		return GST_PAD_PROBE_OK;
 	}
 
-	switch (GST_VIDEO_INFO_FORMAT(&(dec->info))) {
-	case GST_VIDEO_FORMAT_I420:
-		dec->format = DRM_FORMAT_YUV420;
-		break;
-	case GST_VIDEO_FORMAT_NV12:
-		dec->format = DRM_FORMAT_NV12;
-		break;
-	case GST_VIDEO_FORMAT_YUY2:
-		dec->format = DRM_FORMAT_YUYV;
-		break;
-	default:
+	if (GST_VIDEO_INFO_FORMAT(&(dec->info)) != gst_format) {
 		GST_ERROR("unknown format\n");
 		return GST_PAD_PROBE_OK;
 	}
@@ -271,7 +263,7 @@ video_init(const struct egl *egl, const struct gbm *gbm, const char *filename)
 
 	/* Setup pipeline: */
 	static const char *pipeline =
-		"filesrc name=\"src\" ! decodebin name=\"decode\" ! video/x-raw ! appsink sync=false name=\"sink\"";
+		"filesrc name=\"src\" ! decodebin name=\"decode\" ! videoconvert ! video/x-raw,format=BGRx ! appsink sync=false name=\"sink\"";
 	dec->pipeline = gst_parse_launch(pipeline, NULL);
 
 	dec->sink = gst_bin_get_by_name(GST_BIN(dec->pipeline), "sink");
@@ -334,7 +326,7 @@ set_last_frame(struct decoder *dec, EGLImage frame, GstSample *samp)
 
 // TODO this could probably be a helper re-used by cube-tex:
 static int
-buf_to_fd(const struct gbm *gbm, int size, void *ptr)
+buf_to_fd(const struct gbm *gbm, unsigned w, unsigned h, unsigned stride_orig, void *ptr)
 {
 	struct gbm_bo *bo;
 	void *map, *map_data = NULL;
@@ -342,11 +334,16 @@ buf_to_fd(const struct gbm *gbm, int size, void *ptr)
 	int fd;
 
 	/* NOTE: do not actually use GBM_BO_USE_WRITE since that gets us a dumb buffer: */
-	bo = gbm_bo_create(gbm->dev, size, 1, GBM_FORMAT_R8, GBM_BO_USE_LINEAR);
+	bo = gbm_bo_create(gbm->dev, w, h, format, GBM_BO_USE_LINEAR | GBM_BO_USE_SCANOUT);
 
-	map = gbm_bo_map(bo, 0, 0, size, 1, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
+	map = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_WRITE, &stride, &map_data);
 
-	memcpy(map, ptr, size);
+	if (stride != stride_orig) {
+		GST_ERROR("strides mismatch: stride=%u, stride_orig=%u\n", stride, stride_orig);
+		return -1;
+	}
+
+	memcpy(map, ptr, h * stride_orig);
 
 	gbm_bo_unmap(bo, map_data);
 
@@ -361,32 +358,27 @@ buf_to_fd(const struct gbm *gbm, int size, void *ptr)
 static EGLImage
 buffer_to_image(struct decoder *dec, GstBuffer *buf)
 {
-	struct { int fd, offset, stride; } planes[MAX_NUM_PLANES];
 	GstVideoMeta *meta = gst_buffer_get_video_meta(buf);
 	EGLImage image;
 	guint nmems = gst_buffer_n_memory(buf);
-	guint nplanes = GST_VIDEO_INFO_N_PLANES(&(dec->info));
-	guint i;
-	guint width, height;
 	gboolean is_dmabuf_mem;
 	GstMemory *mem;
 	int dmabuf_fd = -1;
 
-	static const EGLint egl_dmabuf_plane_fd_attr[MAX_NUM_PLANES] = {
-		EGL_DMA_BUF_PLANE0_FD_EXT,
-		EGL_DMA_BUF_PLANE1_FD_EXT,
-		EGL_DMA_BUF_PLANE2_FD_EXT,
-	};
-	static const EGLint egl_dmabuf_plane_offset_attr[MAX_NUM_PLANES] = {
-		EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-		EGL_DMA_BUF_PLANE1_OFFSET_EXT,
-		EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-	};
-	static const EGLint egl_dmabuf_plane_pitch_attr[MAX_NUM_PLANES] = {
-		EGL_DMA_BUF_PLANE0_PITCH_EXT,
-		EGL_DMA_BUF_PLANE1_PITCH_EXT,
-		EGL_DMA_BUF_PLANE2_PITCH_EXT,
-	};
+	if (!meta) {
+		GST_ERROR("no video stream meta");
+		return EGL_NO_IMAGE_KHR;
+	}
+
+	if (meta->n_planes != 1) {
+		GST_ERROR("incorrect number of planes: %u", meta->n_planes);
+		return EGL_NO_IMAGE_KHR;
+	}
+
+	if (meta->format != gst_format) {
+		GST_ERROR("incorrect format: %s", gst_video_format_to_string(meta->format));
+		return EGL_NO_IMAGE_KHR;
+	}
 
 	/* Query gst_is_dmabuf_memory() here, since the gstmemory
 	 * block might get merged below by gst_buffer_map(), meaning
@@ -413,7 +405,7 @@ buffer_to_image(struct decoder *dec, GstBuffer *buf)
 	} else {
 		GstMapInfo map_info;
 		gst_buffer_map(buf, &map_info, GST_MAP_READ);
-		dmabuf_fd = buf_to_fd(dec->gbm, map_info.size, map_info.data);
+		dmabuf_fd = buf_to_fd(dec->gbm, meta->width, meta->height, meta->stride[0], map_info.data);
 		gst_buffer_unmap(buf, &map_info);
 	}
 
@@ -422,76 +414,32 @@ buffer_to_image(struct decoder *dec, GstBuffer *buf)
 		return EGL_NO_IMAGE_KHR;
 	}
 
-	/* Usually, a videometa should be present, since by using the internal kmscube
-	 * video_appsink element instead of the regular appsink, it is guaranteed that
-	 * video meta support is declared in the video_appsink's allocation query.
-	 * However, this assumes that upstream elements actually look at the allocation
-	 * query's contents properly, or that they even send a query at all. If this
-	 * is not the case, then upstream might decide to push frames without adding
-	 * a meta. It can happen, and in this case, look at the video info data as
-	 * a fallback (it is computed out of the input caps).
-	 */
-	if (meta) {
-		for (i = 0; i < nplanes; i++) {
-			planes[i].fd = dmabuf_fd;
-			planes[i].offset = meta->offset[i];
-			planes[i].stride = meta->stride[i];
-		}
-	} else {
-		for (i = 0; i < nplanes; i++) {
-			planes[i].fd = dmabuf_fd;
-			planes[i].offset = GST_VIDEO_INFO_PLANE_OFFSET(&(dec->info), i);
-			planes[i].stride = GST_VIDEO_INFO_PLANE_STRIDE(&(dec->info), i);
-		}
-	}
-
-	width = GST_VIDEO_INFO_WIDTH(&(dec->info));
-	height = GST_VIDEO_INFO_HEIGHT(&(dec->info));
-
 	/* output some information at the beginning (= when the first frame is handled) */
 	if (dec->frame == 0) {
-		GstVideoFormat pixfmt;
-		const char *pixfmt_str;
-
-		pixfmt = GST_VIDEO_INFO_FORMAT(&(dec->info));
-		pixfmt_str = gst_video_format_to_string(pixfmt);
-
 		printf("===================================\n");
 		printf("GStreamer video stream information:\n");
-		printf("  size: %u x %u pixel\n", width, height);
-		printf("  pixel format: %s  number of planes: %u\n", pixfmt_str, nplanes);
+		printf("  size: %u x %u pixel\n", meta->width, meta->height);
 		printf("  can use zero-copy: %s\n", yesno(is_dmabuf_mem));
-		printf("  video meta found: %s\n", yesno(meta != NULL));
 		printf("===================================\n");
 	}
 
 	{
-		/* Initialize the first 6 attributes with values that are
-		 * plane invariant (width, height, format) */
-		EGLint attr[6 + 6*(MAX_NUM_PLANES) + 1] = {
-			EGL_WIDTH, width,
-			EGL_HEIGHT, height,
-			EGL_LINUX_DRM_FOURCC_EXT, dec->format
+		EGLint attr[] = {
+			EGL_WIDTH,                     meta->width,
+			EGL_HEIGHT,                    meta->height,
+			EGL_LINUX_DRM_FOURCC_EXT,      format,
+			EGL_DMA_BUF_PLANE0_FD_EXT,     dmabuf_fd,
+			EGL_DMA_BUF_PLANE0_OFFSET_EXT, meta->offset[0],
+			EGL_DMA_BUF_PLANE0_PITCH_EXT,  meta->stride[0],
+			EGL_NONE
 		};
-
-		for (i = 0; i < nplanes; i++) {
-			attr[6 + 6*i + 0] = egl_dmabuf_plane_fd_attr[i];
-			attr[6 + 6*i + 1] = planes[i].fd;
-			attr[6 + 6*i + 2] = egl_dmabuf_plane_offset_attr[i];
-			attr[6 + 6*i + 3] = planes[i].offset;
-			attr[6 + 6*i + 4] = egl_dmabuf_plane_pitch_attr[i];
-			attr[6 + 6*i + 5] = planes[i].stride;
-		}
-
-		attr[6 + 6*nplanes] = EGL_NONE;
 
 		image = dec->egl->eglCreateImageKHR(dec->egl->display, EGL_NO_CONTEXT,
 				EGL_LINUX_DMA_BUF_EXT, NULL, attr);
 	}
 
 	/* Cleanup */
-	for (unsigned i = 0; i < nplanes; i++)
-		close(planes[i].fd);
+	close(dmabuf_fd);
 
 	return image;
 }
